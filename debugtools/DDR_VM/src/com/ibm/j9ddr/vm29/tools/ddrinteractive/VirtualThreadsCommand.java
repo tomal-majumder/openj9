@@ -37,6 +37,7 @@ import com.ibm.j9ddr.vm29.pointer.generated.MM_ContinuationObjectListPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.MM_GCExtensionsPointer;
 import com.ibm.j9ddr.vm29.pointer.helper.J9ObjectHelper;
 import com.ibm.j9ddr.vm29.pointer.helper.J9RASHelper;
+import com.ibm.j9ddr.vm29.structure.J9Consts;
 import com.ibm.j9ddr.vm29.types.UDATA;
 
 /**
@@ -51,9 +52,11 @@ import com.ibm.j9ddr.vm29.types.UDATA;
  *     ...
  */
 public class VirtualThreadsCommand extends Command {
+	private static final long GC_CONTINUATION_STATE_CARRIERID_MASK = ~0xFFL;
 	private static J9ObjectFieldOffset vthreadOffset;
 	private static J9ObjectFieldOffset vmRefOffset;
 	private static J9ObjectFieldOffset nameOffset;
+	private static J9ObjectFieldOffset stateOffset;
 
 	private static J9ObjectPointer getVirtualThread(J9ObjectPointer continuation) throws CorruptDataException {
 		if (vthreadOffset == null) {
@@ -81,6 +84,26 @@ public class VirtualThreadsCommand extends Command {
 		return (name != null) ? name : "<N/A>";
 	}
 
+	/**
+	 * Returns the carrier J9VMThread address if the continuation is fully mounted,
+	 * or 0 if it is unmounted or only pending to be mounted.
+	 */
+	private static long getCarrierThreadAddress(J9ObjectPointer continuation) throws CorruptDataException {
+		if (stateOffset == null) {
+			stateOffset = J9ObjectHelper.getFieldOffset(continuation, "state", "J");
+		}
+
+		UDATA state = new UDATA(J9ObjectHelper.getLongField(continuation, stateOffset));
+		boolean hasCarrierId = state.anyBitsIn(GC_CONTINUATION_STATE_CARRIERID_MASK);
+		boolean pendingToBeMounted = state.allBitsIn(J9Consts.J9_GC_CONTINUATION_STATE_PENDING_TO_BE_MOUNTED);
+
+		if(hasCarrierId && !pendingToBeMounted) {
+				return state.longValue() & GC_CONTINUATION_STATE_CARRIERID_MASK;
+		}
+		
+		return 0;
+	}
+
 	public VirtualThreadsCommand() {
 		addCommand("vthreads", "", "Lists virtual threads");
 	}
@@ -105,9 +128,13 @@ public class VirtualThreadsCommand extends Command {
 	 */
 	private static void displayVirtualThreads(J9JavaVMPointer vm, PrintStream out) throws CorruptDataException, NoSuchFieldException {
 		String addressFormat = "0x%0" + (UDATA.SIZEOF * 2) + "x";
-		String outputFormat = "!continuationstack " + addressFormat
+		String mountedFormat = "!stack " + addressFormat + " !j9vmthread " + addressFormat
 				+ " !j9vmcontinuation " + addressFormat
-				+ " !j9object %s (Continuation) !j9object %s (VThread) - %s%n";
+				+ " !j9object %s (Continuation) !j9object %s (VThread) - %s [MOUNTED]%n";
+		String unmountedFormat = "!continuationstack " + addressFormat
+				+ " !j9vmcontinuation " + addressFormat
+				+ " !j9object %s (Continuation) !j9object %s (VThread) - %s [UNMOUNTED]%n";
+		
 		MM_GCExtensionsPointer extensions = GCBase.getExtensions();
 		UDATA linkOffset = extensions.accessBarrier()._continuationLinkOffset();
 		MM_ContinuationObjectListPointer continuationObjectList = extensions.continuationObjectLists();
@@ -118,14 +145,18 @@ public class VirtualThreadsCommand extends Command {
 				long vmRef = getVmRef(continuation);
 				J9ObjectPointer vthread = getVirtualThread(continuation);
 				String name = getName(vthread);
+				long carrierAddress = getCarrierThreadAddress(continuation);
 
-				out.format(
-						outputFormat,
-						vmRef,
-						vmRef,
-						continuation.getHexAddress(),
-						vthread.getHexAddress(),
-						name);
+				if (carrierAddress != 0) {
+					out.format(mountedFormat,
+							carrierAddress, carrierAddress,
+							vmRef,
+							continuation.getHexAddress(), vthread.getHexAddress(), name);
+				} else {
+					out.format(unmountedFormat,
+							vmRef, vmRef,
+							continuation.getHexAddress(), vthread.getHexAddress(), name);
+				}
 				continuation = ObjectReferencePointer.cast(continuation.addOffset(linkOffset)).at(0);
 			}
 			continuationObjectList = continuationObjectList._nextList();

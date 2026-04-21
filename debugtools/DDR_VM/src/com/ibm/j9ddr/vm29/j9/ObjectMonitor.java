@@ -21,12 +21,14 @@
  */
 package com.ibm.j9ddr.vm29.j9;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import com.ibm.j9ddr.CorruptDataException;
 import com.ibm.j9ddr.vm29.pointer.generated.J9ObjectMonitorPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.J9ObjectPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.J9ThreadAbstractMonitorPointer;
+import com.ibm.j9ddr.vm29.pointer.generated.J9VMContinuationPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.J9VMThreadPointer;
 
 public abstract class ObjectMonitor implements Comparable<ObjectMonitor>
@@ -51,12 +53,19 @@ public abstract class ObjectMonitor implements Comparable<ObjectMonitor>
 				} else {
 					return v1;
 				}
-			default:
+			case 1:
 				ObjectMonitor_V2 v2 = new ObjectMonitor_V2(object);
 				if(v2.getLockword().isNull() && !v2.isInTable()) {
 					return null;
 				} else {
 					return v2;
+				}
+			default:
+				ObjectMonitor_V3 v3 = new ObjectMonitor_V3(object);
+				if(v3.getLockword().isNull() && !v3.isInTable()) {
+					return null;
+				} else {
+					return v3;
 				}
 		}
 	}
@@ -83,9 +92,37 @@ public abstract class ObjectMonitor implements Comparable<ObjectMonitor>
 	public abstract List<J9VMThreadPointer> getWaitingThreads() throws CorruptDataException;
 
 	public abstract List<J9VMThreadPointer> getBlockedThreads() throws CorruptDataException;
-	
+
 	public abstract J9ThreadAbstractMonitorPointer getInflatedMonitor();
 
 	public abstract J9ObjectMonitorPointer getJ9ObjectMonitorPointer();
-	
+
+	public J9VMContinuationPointer getOwnerContinuation() throws CorruptDataException
+	{
+		return J9VMContinuationPointer.NULL;
+	}
+
+	public boolean isOwnedByUnmountedVThread() throws CorruptDataException
+	{
+		return false;
+	}
+
+	/** Returns continuations doing object.wait() on this monitor. Override in ObjectMonitor_V3. */
+	public List<J9VMContinuationPointer> getWaitingContinuations() throws CorruptDataException
+	{
+		return new ArrayList<>();
+	}
+
+	/** Returns continuations blocked on monitor enter (contended). Override in ObjectMonitor_V3. */
+	public List<J9VMContinuationPointer> getBlockedContinuations() throws CorruptDataException
+	{
+		return new ArrayList<>();
+	}
+
+	/** Returns the count of virtual threads waiting or blocked on this monitor. Override in ObjectMonitor_V3. */
+	public long getVirtualThreadWaitCount() throws CorruptDataException
+	{
+		return 0;
+	}
+
 }

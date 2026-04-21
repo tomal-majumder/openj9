@@ -40,9 +40,12 @@ import com.ibm.j9ddr.vm29.j9.ObjectMonitor;
 import com.ibm.j9ddr.vm29.j9.Pool;
 import com.ibm.j9ddr.vm29.j9.SlotIterator;
 import com.ibm.j9ddr.vm29.j9.SystemMonitor;
+import com.ibm.j9ddr.vm29.j9.J9ObjectFieldOffset;
+import com.ibm.j9ddr.vm29.j9.gc.GCBase;
 import com.ibm.j9ddr.vm29.j9.gc.GCVMThreadListIterator;
 import com.ibm.j9ddr.vm29.j9.walkers.HeapWalker;
 import com.ibm.j9ddr.vm29.j9.walkers.MonitorIterator;
+import com.ibm.j9ddr.vm29.pointer.ObjectReferencePointer;
 import com.ibm.j9ddr.vm29.pointer.VoidPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.J9BuildFlags;
 import com.ibm.j9ddr.vm29.pointer.generated.J9JavaVMPointer;
@@ -53,12 +56,19 @@ import com.ibm.j9ddr.vm29.pointer.generated.J9ThreadAbstractMonitorPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.J9ThreadLibraryPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.J9ThreadMonitorPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.J9ThreadPointer;
+import com.ibm.j9ddr.vm29.pointer.generated.J9VMContinuationPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.J9VMThreadPointer;
+import com.ibm.j9ddr.vm29.pointer.generated.MM_ContinuationObjectListPointer;
+import com.ibm.j9ddr.vm29.pointer.generated.MM_GCExtensionsPointer;
+import com.ibm.j9ddr.vm29.pointer.helper.J9ObjectHelper;
 import com.ibm.j9ddr.vm29.pointer.helper.J9RASHelper;
 import com.ibm.j9ddr.vm29.pointer.helper.J9ThreadHelper;
 import com.ibm.j9ddr.vm29.pointer.helper.J9VMThreadHelper;
 import com.ibm.j9ddr.vm29.structure.J9ThreadAbstractMonitor;
+import com.ibm.j9ddr.vm29.structure.J9VMContinuationState;
+import com.ibm.j9ddr.vm29.tools.ddrinteractive.JavaVersionHelper;
 import com.ibm.j9ddr.vm29.tools.ddrinteractive.monitors.DeadlockDetector;
+import com.ibm.j9ddr.vm29.types.UDATA;
 
 /**
  * 
@@ -108,6 +118,8 @@ public class MonitorsCommand extends Command
 				j9threadCommand(args, out);
 			} else if (monitorCommand.equalsIgnoreCase("j9vmthread")) {
 				j9vmthreadCommand(args, out);
+			} else if (monitorCommand.equalsIgnoreCase("continuation")) {
+				continuationCommand(args, out);
 			} else if (monitorCommand.equalsIgnoreCase("deadlock")) {
 				deadlockCommand(args, out);
 			} else if (monitorCommand.equalsIgnoreCase("help")) {
@@ -120,7 +132,7 @@ public class MonitorsCommand extends Command
 		}
 	}
 	
-	static class FilterOptions 
+	static class FilterOptions
 	{
 		boolean all;
 		boolean owner;
@@ -128,7 +140,7 @@ public class MonitorsCommand extends Command
 		boolean waiting;
 
 		private FilterOptions() {};
-		
+
 		/* Defaults to active */
 		public static FilterOptions defaultOption()
 		{
@@ -138,11 +150,21 @@ public class MonitorsCommand extends Command
 			retVal.waiting = true;
 			return retVal;
 		}
-		
+
+		/* Prints every monitor regardless of owner/blocked/waiting state.
+		 * Needed for unmounted virtual thread continuations where getOwner()
+		 * returns null even though the continuation holds the monitor. */
+		public static FilterOptions noFilterOption()
+		{
+			FilterOptions retVal = new FilterOptions();
+			retVal.all = true;
+			return retVal;
+		}
+
 		public static FilterOptions parseOption(String str) throws DDRInteractiveCommandException
 		{
 			FilterOptions retVal = new FilterOptions();
-			
+
 			if(str.equalsIgnoreCase("all")) {
 				retVal.all = true;
 			} else if(str.equalsIgnoreCase("active")) {
@@ -159,28 +181,28 @@ public class MonitorsCommand extends Command
 				String msg = "Unsupported subcommand \"" + str + "\", see \"!monitors help\" for usage.";
 				throw new DDRInteractiveCommandException(msg);
 			}
-			
+
 			return retVal;
 		}
-		
-		public boolean shouldPrint(ObjectMonitor monitor) throws CorruptDataException 
+
+		public boolean shouldPrint(ObjectMonitor monitor) throws CorruptDataException
 		{
 			if (all) {
 				return true;
 			}
-			
-			if(monitor.getOwner().notNull() && owner) {
+
+			if (owner && (monitor.getOwner().notNull() || monitor.isOwnedByUnmountedVThread())) {
 				return true;
 			}
-			
-			if(!monitor.getBlockedThreads().isEmpty() && blocked) {
+
+			if(blocked && (!monitor.getBlockedThreads().isEmpty() || !monitor.getBlockedContinuations().isEmpty())) {
 				return true;
 			}
-			
-			if(!monitor.getWaitingThreads().isEmpty() && waiting) {
+
+			if(waiting && (!monitor.getWaitingThreads().isEmpty() || !monitor.getWaitingContinuations().isEmpty())) {
 				return true;
 			}
-			
+
 			return false;
 		}
 		
@@ -207,6 +229,9 @@ public class MonitorsCommand extends Command
 		}
 
 	}
+
+	/* Cached field offset for reading Continuation.vmRef — shared across calls. */
+	private static J9ObjectFieldOffset contVmRefOffset;
 
 	/**
 	 * See {@link MonitorsCommand#helpCommand(String[], PrintStream)} for
@@ -283,6 +308,10 @@ public class MonitorsCommand extends Command
 				}
 				
 			}
+
+			// If we get here, we didn't find the thread in the thread pool
+			// if java >= 24, it could be an unmounted virtual thread continuation
+			
 
 		} catch (CorruptDataException e) {
 			throw new DDRInteractiveCommandException(e);
@@ -470,7 +499,114 @@ public class MonitorsCommand extends Command
 		}
 	}
 	
-	
+	/**
+	 * Dumps all active monitors for an UNMOUNTED virtual thread continuation.
+	 *
+	 * Example:
+	 *   !monitors continuation 0x00007fe78c0f9600
+	 *
+	 * @param args command arguments; args[0] is a hex address of a Continuation object or J9VMContinuation
+	 * @param out output stream
+	 */
+	private void continuationCommand(String[] args, PrintStream out) throws DDRInteractiveCommandException
+	{
+		if (args.length < 2) {
+			out.println("This command takes one address argument: \"!monitors continuation <address>\"");
+			return;
+		}
+		
+		try {
+			J9JavaVMPointer vm = J9RASHelper.getVM(DataType.getJ9RASPointer());
+			if (JavaVersionHelper.ensureMinimumJavaVersion(24, vm, out)) {
+				long address = CommandUtils.parsePointer(args[1], J9BuildFlags.J9VM_ENV_DATA64);
+				VoidPointer ptr = VoidPointer.cast(address);
+
+				/* Resolve J9VMContinuation pointer from the given address */
+				J9VMContinuationPointer j9VMContinuation = resolveContinuationPointer(ptr, out);
+				if (j9VMContinuation.isNull()) {
+					out.format("Could not find any Continuation at 0x%x%n", address);
+					return;
+				}
+				out.format("Found j9vmcontinuation @ 0x%x%n", j9VMContinuation.getAddress());
+				printMonitorsForJ9VMContinuation(out, vm, j9VMContinuation);
+			} else {
+				out.println("Continuation command requires Java 24 or later");
+			}
+		} catch (CorruptDataException | NoSuchFieldException e) {
+			throw new DDRInteractiveCommandException(e);
+		}
+	}
+
+
+	private static J9VMContinuationPointer resolveContinuationPointer(VoidPointer ptr, PrintStream out)
+			throws CorruptDataException, NoSuchFieldException
+	{
+		MM_GCExtensionsPointer extensions = GCBase.getExtensions();
+		UDATA linkOffset = extensions.accessBarrier()._continuationLinkOffset();
+		MM_ContinuationObjectListPointer continuationObjectList = extensions.continuationObjectLists();
+
+		while (continuationObjectList.notNull()) {
+			J9ObjectPointer continuation = continuationObjectList._head();
+			while (continuation.notNull()) {
+				if(contVmRefOffset == null) {
+					contVmRefOffset = J9ObjectHelper.getFieldOffset(continuation, "vmRef", "J");
+				}
+
+				long vmRef = J9ObjectHelper.getLongField(continuation, contVmRefOffset);
+				J9VMContinuationPointer j9VmContinuation = J9VMContinuationPointer.cast(vmRef);
+
+				boolean isContinuationObject = continuation.equals(ptr);
+				if (isContinuationObject || j9VmContinuation.equals(ptr)) {
+					if (isContinuationObject) {
+						out.format("Found continuation object at 0x%x%n", ptr.getAddress());
+					}
+					return j9VmContinuation;
+				}
+				continuation = ObjectReferencePointer.cast(continuation.addOffset(linkOffset)).at(0);
+			}
+			continuationObjectList = continuationObjectList._nextList();
+		}
+		return J9VMContinuationPointer.NULL;
+	}
+
+	private void printMonitorsForJ9VMContinuation(PrintStream out, J9JavaVMPointer vm, J9VMContinuationPointer j9VMContinuation) throws CorruptDataException, NoSuchFieldException
+	{
+		FilterOptions filter = FilterOptions.noFilterOption();
+
+		MonitorIterator iterator = new MonitorIterator(vm);
+		while (iterator.hasNext()) {
+			Object current = iterator.next();
+			if (current instanceof ObjectMonitor) {
+				ObjectMonitor objMon = (ObjectMonitor) current;
+				if (objMon.isOwnedByUnmountedVThread()) {
+					J9VMContinuationPointer ownerContinuation = objMon.getOwnerContinuation();
+					if (ownerContinuation.notNull() && ownerContinuation.equals(j9VMContinuation)) {
+						out.format("Owns Object Monitor:%n\t");
+						writeObjectMonitor(filter, objMon, out);
+					}
+				}
+			}
+		}
+
+		J9ObjectMonitorPointer waitMonitor = j9VMContinuation.objectWaitMonitor();
+		if (waitMonitor.notNull()) {
+			long returnState = j9VMContinuation.returnState().longValue();
+			J9ThreadAbstractMonitorPointer lock = J9ThreadAbstractMonitorPointer.cast(waitMonitor.monitor());
+			if (lock.notNull() && !lock.userData().eq(0)) {
+				J9ObjectPointer obj = J9ObjectPointer.cast(lock.userData());
+				ObjectMonitor objMon = ObjectAccessBarrier.getMonitor(obj);
+				if (objMon != null) {
+					if (returnState == J9VMContinuationState.J9VM_CONTINUATION_RETURN_FROM_OBJECT_WAIT) {
+						out.format("Waiting on (Notify Waiter):%n\t");
+					} else {
+						out.format("Blocking on (Enter Waiter):%n\t");
+					}
+					writeObjectMonitor(filter, objMon, out);
+				}
+			}
+		}
+	}
+
 	/**
 	 * See {@link MonitorsCommand#helpCommand(String[], PrintStream)} for
 	 * function documentation
@@ -810,25 +946,43 @@ public class MonitorsCommand extends Command
 			J9VMThreadPointer ownerThreadPointer = objMon.getOwner();
 
 			if (ownerThreadPointer.notNull()) {
-				out.append(String.format("\tOwner:\t%s\t%s\n", 
+				out.append(String.format("\tOwner:\t%s\t%s\n",
 						ownerThreadPointer.formatShortInteractive(),
 						J9VMThreadHelper.getName(ownerThreadPointer)));
+			} else if (objMon.isOwnedByUnmountedVThread()) {
+				J9VMContinuationPointer ownerContinuation = objMon.getOwnerContinuation();
+				if(ownerContinuation.notNull()) {
+					out.append(String.format("\tOwner:\t%s\t(virtual thread, UNMOUNTED)%n",
+						ownerContinuation.formatShortInteractive()));
+				}
 			}
 
-			if (!objMon.getBlockedThreads().isEmpty()) {
+			List<J9VMContinuationPointer> blockedConts = objMon.getBlockedContinuations();
+			List<J9VMContinuationPointer> waitingConts = objMon.getWaitingContinuations();
+
+			if (!objMon.getBlockedThreads().isEmpty() || !blockedConts.isEmpty()) {
 				out.append(String.format("\t%s\t\n", "Blocking (Enter Waiter):"));
 				for (J9VMThreadPointer threadPtr : objMon.getBlockedThreads()) {
-					out.append(String.format("\t\t%s\t%s\n", 
+					out.append(String.format("\t\t%s\t%s\n",
 							threadPtr.formatShortInteractive(),
 							J9VMThreadHelper.getName(threadPtr)));
 				}
+				for (J9VMContinuationPointer cont : blockedConts) {
+					out.append(String.format("\t\t%s\t(virtual thread, UNMOUNTED)%n",
+							cont.formatShortInteractive()));
+				}
 			}
-			if (!objMon.getWaitingThreads().isEmpty()) {
+
+			if (!objMon.getWaitingThreads().isEmpty() || !waitingConts.isEmpty()) {
 				out.append(String.format("\t%s\t\n", "Waiting (Notify Waiter):"));
 				for (J9VMThreadPointer threadPtr : objMon.getWaitingThreads()) {
-					out.append(String.format("\t\t%s\t%s\n", 
+					out.append(String.format("\t\t%s\t%s\n",
 							threadPtr.formatShortInteractive(),
 							J9VMThreadHelper.getName(threadPtr)));
+				}
+				for (J9VMContinuationPointer cont : waitingConts) {
+					out.append(String.format("\t\t%s\t(virtual thread, UNMOUNTED)%n",
+							cont.formatShortInteractive()));
 				}
 			}
 
@@ -967,6 +1121,10 @@ public class MonitorsCommand extends Command
 				+ "\n"
 				+ "!monitors thread <address>\n"
 				+ "	- dump all monitors that are active for the specified J9Thread/J9VMThread/java.lang.Thread\n"
+				+ "\n"
+				+ "!monitors continuation <address>\n"
+				+ "	- dump all monitors that are active for an unmounted virtual thread continuation (Java 24+)\n"
+				+ "	- address: Java Continuation heap object (!j9object) or J9VMContinuation native pointer\n"
 				+ "\n"
 				+ "!monitors deadlock\n"
 				+ "	- search for deadlock conditions (supports J9Threads and J9VMThreads)\n"
