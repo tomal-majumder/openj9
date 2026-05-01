@@ -53,6 +53,7 @@ import com.ibm.j9ddr.vm29.pointer.generated.J9ThreadAbstractMonitorPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.J9ThreadLibraryPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.J9ThreadMonitorPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.J9ThreadPointer;
+import com.ibm.j9ddr.vm29.pointer.generated.J9VMContinuationPointer;
 import com.ibm.j9ddr.vm29.pointer.generated.J9VMThreadPointer;
 import com.ibm.j9ddr.vm29.pointer.helper.J9RASHelper;
 import com.ibm.j9ddr.vm29.pointer.helper.J9ThreadHelper;
@@ -163,24 +164,24 @@ public class MonitorsCommand extends Command
 			return retVal;
 		}
 		
-		public boolean shouldPrint(ObjectMonitor monitor) throws CorruptDataException 
+		public boolean shouldPrint(ObjectMonitor monitor) throws CorruptDataException
 		{
 			if (all) {
 				return true;
 			}
-			
-			if(monitor.getOwner().notNull() && owner) {
+
+			if (owner && (monitor.getOwner().notNull() || monitor.isOwnedByUnmountedVThread())) {
 				return true;
 			}
-			
-			if(!monitor.getBlockedThreads().isEmpty() && blocked) {
+
+			if (blocked && (!monitor.getBlockedThreads().isEmpty() || !monitor.getBlockedContinuations().isEmpty())) {
 				return true;
 			}
-			
-			if(!monitor.getWaitingThreads().isEmpty() && waiting) {
+
+			if (waiting && (!monitor.getWaitingThreads().isEmpty() || !monitor.getWaitingContinuations().isEmpty())) {
 				return true;
 			}
-			
+
 			return false;
 		}
 		
@@ -810,25 +811,43 @@ public class MonitorsCommand extends Command
 			J9VMThreadPointer ownerThreadPointer = objMon.getOwner();
 
 			if (ownerThreadPointer.notNull()) {
-				out.append(String.format("\tOwner:\t%s\t%s\n", 
+				out.append(String.format("\tOwner:\t%s\t%s\n",
 						ownerThreadPointer.formatShortInteractive(),
 						J9VMThreadHelper.getName(ownerThreadPointer)));
+			} else if (objMon.isOwnedByUnmountedVThread()) {
+				J9VMContinuationPointer ownerContinuation = objMon.getOwnerContinuation();
+				if (ownerContinuation.notNull()) {
+					out.append(String.format("\tOwner:\t%s\t(virtual thread, UNMOUNTED)%n",
+							ownerContinuation.formatShortInteractive()));
+				}
 			}
 
-			if (!objMon.getBlockedThreads().isEmpty()) {
+			List<J9VMContinuationPointer> blockedConts = objMon.getBlockedContinuations();
+			List<J9VMContinuationPointer> waitingConts = objMon.getWaitingContinuations();
+
+			if (!objMon.getBlockedThreads().isEmpty() || !blockedConts.isEmpty()) {
 				out.append(String.format("\t%s\t\n", "Blocking (Enter Waiter):"));
 				for (J9VMThreadPointer threadPtr : objMon.getBlockedThreads()) {
-					out.append(String.format("\t\t%s\t%s\n", 
+					out.append(String.format("\t\t%s\t%s\n",
 							threadPtr.formatShortInteractive(),
 							J9VMThreadHelper.getName(threadPtr)));
 				}
+				for (J9VMContinuationPointer cont : blockedConts) {
+					out.append(String.format("\t\t%s\t(virtual thread, UNMOUNTED)%n",
+							cont.formatShortInteractive()));
+				}
 			}
-			if (!objMon.getWaitingThreads().isEmpty()) {
+
+			if (!objMon.getWaitingThreads().isEmpty() || !waitingConts.isEmpty()) {
 				out.append(String.format("\t%s\t\n", "Waiting (Notify Waiter):"));
 				for (J9VMThreadPointer threadPtr : objMon.getWaitingThreads()) {
-					out.append(String.format("\t\t%s\t%s\n", 
+					out.append(String.format("\t\t%s\t%s\n",
 							threadPtr.formatShortInteractive(),
 							J9VMThreadHelper.getName(threadPtr)));
+				}
+				for (J9VMContinuationPointer cont : waitingConts) {
+					out.append(String.format("\t\t%s\t(virtual thread, UNMOUNTED)%n",
+							cont.formatShortInteractive()));
 				}
 			}
 

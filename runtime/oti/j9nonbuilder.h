@@ -5741,6 +5741,7 @@ typedef struct J9JITGPRSpillArea {
  */
 typedef uintptr_t ContinuationState;
 
+/* @ddr_namespace: map_to_type=J9VMContinuationState */
 #if JAVA_SPEC_VERSION >= 19
 #define J9VM_CONTINUATION_RETURN_FROM_YIELD 1
 #if JAVA_SPEC_VERSION >= 24
