@@ -1177,6 +1177,7 @@ static UDATA terminateRemainingThreads(J9VMThread* vmThread) {
 	UDATA rc = 0;
 	J9VMThread * currentThread;
 	J9JavaVM * vm = vmThread->javaVM;
+	J9VMThread * jfrVMThread = NULL;
 
 	Trc_VM_terminateRemainingThreads_Entry(vmThread);
 
@@ -1204,19 +1205,27 @@ static UDATA terminateRemainingThreads(J9VMThread* vmThread) {
 		 * So for this release we've decided to go for a conservative answer and simply
 		 * refuse to shutdown if there are daemon threads still running.
 		 */
-		if (currentThread->privateFlags & J9_PRIVATE_FLAGS_SYSTEM_THREAD ) {
+		if (currentThread->privateFlags & J9_PRIVATE_FLAGS_SYSTEM_THREAD) {
 			/* do nothing. This thread will be cleaned up specially */
 			Trc_VM_terminateRemainingThreads_SystemThread(vmThread, currentThread);
+		} else if (currentThread->publicFlags & J9_PUBLIC_FLAGS_HALT_THREAD_INSPECTION) {
+			/* do nothing. This thread has been halted and will not access VM internals during teardown */
 		} else {
-			Trc_VM_terminateRemainingThreads_Daemon(vmThread, currentThread);
-			rc += 1;
-			if (vm->verboseLevel & VERBOSE_SHUTDOWN) {
-				PORT_ACCESS_FROM_JAVAVM(vm);
-				const char * format = j9nls_lookup_message(J9NLS_INFO, J9NLS_VM_THREAD_PREVENTING_SHUTDOWN,
-					/* Cannot rely on NLS database existing at this point.  Add a default message string */
-					"Thread \"%s\" is still alive after running the shutdown hooks.\n");
-				char * threadName = getOMRVMThreadName(currentThread->omrVMThread);
-				j9file_printf(J9PORT_TTY_ERR, format, threadName);
+			char *name = getOMRVMThreadName(currentThread->omrVMThread);
+			if (NULL != name && 0 == strcmp(name, "JFR Periodic Tasks")) {
+				releaseOMRVMThreadName(currentThread->omrVMThread);
+				setHaltFlag(currentThread, J9_PUBLIC_FLAGS_HALT_THREAD_INSPECTION);
+				jfrVMThread = currentThread;
+			} else {
+				Trc_VM_terminateRemainingThreads_Daemon(vmThread, currentThread);
+				rc += 1;
+				if (vm->verboseLevel & VERBOSE_SHUTDOWN) {
+					PORT_ACCESS_FROM_JAVAVM(vm);
+					const char * format = j9nls_lookup_message(J9NLS_INFO, J9NLS_VM_THREAD_PREVENTING_SHUTDOWN,
+						/* Cannot rely on NLS database existing at this point.  Add a default message string */
+						"Thread \"%s\" is still alive after running the shutdown hooks.\n");
+					j9file_printf(J9PORT_TTY_ERR, format, name);
+				}
 				releaseOMRVMThreadName(currentThread->omrVMThread);
 			}
 		}
@@ -1230,6 +1239,28 @@ static UDATA terminateRemainingThreads(J9VMThread* vmThread) {
 	}
 
 	releaseExclusiveVMAccess(vmThread);
+
+	/* Call Thread.exit() on the JFR thread's Java object now that we are out of
+	 * exclusive access.  JNI calls do exitVMToJNI internally (inNative=TRUE, VM
+	 * access dropped), so re-enter with enterVMFromJNI afterwards to restore
+	 * inNative=FALSE before internalReleaseVMAccess. */
+	if (NULL != jfrVMThread && NULL != jfrVMThread->threadObject) {
+		JNIEnv *env = (JNIEnv *)vmThread;
+		jclass threadClass = (*env)->FindClass(env, "java/lang/Thread");
+		if (NULL != threadClass) {
+			jmethodID exitMID = (*env)->GetMethodID(env, threadClass, "exit", "()V");
+			if (NULL != exitMID) {
+				jobject threadObj = j9jni_createLocalRef(env, jfrVMThread->threadObject);
+				if (NULL != threadObj) {
+					(*env)->CallVoidMethod(env, threadObj, exitMID);
+					(*env)->ExceptionClear(env);
+					(*env)->DeleteLocalRef(env, threadObj);
+				}
+			}
+		}
+		enterVMFromJNI(vmThread);
+	}
+
 	internalReleaseVMAccess(vmThread);
 
 	Trc_VM_terminateRemainingThreads_Exit(vmThread, rc);
