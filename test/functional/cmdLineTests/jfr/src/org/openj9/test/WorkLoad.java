@@ -37,6 +37,8 @@ public class WorkLoad {
 
 	private static interface GlobalLoack { }
 
+	private static final Method EMIT_DATA_LOSS_METHOD = getEmitDataLossMethod();
+
 	public static double average;
 	public static double stdDev;
 
@@ -240,11 +242,22 @@ public class WorkLoad {
 
 	static final class ClassLoaderTestClass { }
 
-	private void emitDataLoss() {
+	private static Method getEmitDataLossMethod() {
 		try {
 			Class<?> jvmClass = Class.forName("jdk.jfr.internal.JVM");
-			Method emitDataLossMethod = jvmClass.getMethod("emitDataLoss", long.class);
-			emitDataLossMethod.invoke(null, 1024L);
+			return jvmClass.getMethod("emitDataLoss", long.class);
+		} catch (Exception e) {
+			return null;
+		}
+	}
+
+	private void emitDataLoss() {
+		if (null == EMIT_DATA_LOSS_METHOD) {
+			return;
+		}
+
+		try {
+			EMIT_DATA_LOSS_METHOD.invoke(null, 1024L);
 		} catch (Exception e) {
 			e.printStackTrace();
 		}
