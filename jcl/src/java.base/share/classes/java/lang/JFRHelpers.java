@@ -255,6 +255,7 @@ final class JFRHelpers {
 				Module jdkJFR = jfrjvmClass.getModule();
 				Module systemUnnamedModule = VM.getUnnamedModuleForSystemLoader();
 				jdkJFR.implAddExports("jdk.jfr.internal", javabase);
+				jdkJFR.implAddExportsToAllUnnamed("jdk.jfr.internal");
 				jdkJFR.implAddExports("jdk.jfr.internal.dcmd", javabase);
 				jdkJFR.implAddExports("jdk.jfr.internal.handlers", systemUnnamedModule);
 				jdkJFR.implAddExportsToAllUnnamed("jdk.jfr.internal.handlers");
