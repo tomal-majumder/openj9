@@ -702,10 +702,27 @@ void JNICALL
 Java_jdk_jfr_internal_JVM_setOutput(JNIEnv *env, jobject obj, jstring file)
 {
 	J9VMThread *currentThread = (J9VMThread*) env;
-	if (NULL != currentThread->javaVM->jfrState.jfrFileName) {
+	BOOLEAN hasCurrentFile = (NULL != currentThread->javaVM->jfrState.jfrFileName);
+	jboolean fileOpened = JNI_FALSE;
+
+	/* Disk recording: write the buffered data into the current chunk before switching. */
+	if (hasCurrentFile) {
 		Java_com_ibm_oti_vm_VM_jfrDump(env, NULL);
 	}
-	Java_com_ibm_oti_vm_VM_setJFRRecordingFileName(env, NULL, file);
+
+	fileOpened = Java_com_ibm_oti_vm_VM_setJFRRecordingFileName(env, NULL, file);
+
+	/* No file was open while recording: the data so far is only in memory (disk=false).
+	 * Write it into the new file, e.g. the destination when a memory recording stops.
+	 * The recording-started check excludes disk recording start, where the first chunk
+	 * file is set before beginRecording and there is no data to write yet.
+	 */
+	if (!hasCurrentFile
+		&& (JNI_TRUE == fileOpened)
+		&& (JNI_TRUE == Java_com_ibm_oti_vm_VM_isJFRRecordingStarted(env, NULL))
+	) {
+		Java_com_ibm_oti_vm_VM_jfrDump(env, NULL);
+	}
 }
 
 void JNICALL
