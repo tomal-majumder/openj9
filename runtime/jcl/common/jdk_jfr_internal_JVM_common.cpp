@@ -165,7 +165,9 @@ Java_jdk_jfr_internal_JVM_beginRecording(JNIEnv *env, jobject obj)
 	J9InternalVMFunctions *vmFuncs = vm->internalVMFunctions;
 
 	logJFRMessageHelper(currentThread, JFRCOMBINATION_JFR_SYSTEM, JFRLOG_LEVEL_TRACE, JFRLOG_STRING_START_RECORDING);
+	vmFuncs->internalEnterVMFromJNI(currentThread);
 	vmFuncs->startJFRRecording(vm);
+	vmFuncs->internalExitVMToJNI(currentThread);
 }
 
 jlong JNICALL
@@ -206,6 +208,8 @@ Java_jdk_jfr_internal_JVM_endRecording(JNIEnv *env, jobject obj)
 
 	vmFuncs->internalEnterVMFromJNI(currentThread);
 	vmFuncs->stopJFRRecording(vm);
+	/* The last output was written by setOutput, release the file. */
+	vmFuncs->setJFRRecordingFileName(vm, NULL);
 	vmFuncs->internalExitVMToJNI(currentThread);
 }
 
@@ -702,10 +706,31 @@ void JNICALL
 Java_jdk_jfr_internal_JVM_setOutput(JNIEnv *env, jobject obj, jstring file)
 {
 	J9VMThread *currentThread = (J9VMThread*) env;
-	if (NULL != currentThread->javaVM->jfrState.jfrFileName) {
+	J9JavaVM *vm = currentThread->javaVM;
+	J9InternalVMFunctions *vmFuncs = vm->internalVMFunctions;
+	/* Before beginRecording only the new output is set; there is no data to write. */
+	BOOLEAN isRecording = (JNI_TRUE == Java_com_ibm_oti_vm_VM_isJFRRecordingStarted(env, NULL));
+	BOOLEAN hadFile = (-1 != vm->jfrState.blobFileDescriptor);
+
+	/* Disk recording: write the buffered data into the current file before switching. */
+	if (isRecording && hadFile) {
 		Java_com_ibm_oti_vm_VM_jfrDump(env, NULL);
 	}
-	Java_com_ibm_oti_vm_VM_setJFRRecordingFileName(env, NULL, file);
+
+	if (NULL == file) {
+		/* Close the current file, data is kept in memory until a new file is set. */
+		vmFuncs->internalEnterVMFromJNI(currentThread);
+		vmFuncs->setJFRRecordingFileName(vm, NULL);
+		vmFuncs->internalExitVMToJNI(currentThread);
+	} else if ((JNI_TRUE == Java_com_ibm_oti_vm_VM_setJFRRecordingFileName(env, NULL, file))
+		&& isRecording
+		&& !hadFile
+	) {
+		/* The data so far is only in memory (disk=false), write it into the new file,
+		 * e.g. the destination when a memory recording stops.
+		 */
+		Java_com_ibm_oti_vm_VM_jfrDump(env, NULL);
+	}
 }
 
 void JNICALL
@@ -1041,7 +1066,10 @@ Java_jdk_jfr_internal_JVM_emitOldObjectSamples(JNIEnv *env, jobject obj, jlong c
 jboolean JNICALL
 Java_jdk_jfr_internal_JVM_shouldRotateDisk(JNIEnv *env, jobject obj)
 {
-	return ((J9VMThread *)env)->javaVM->jfrState.shouldRotateDisk;
+	J9JavaVM *vm = ((J9VMThread *)env)->javaVM;
+
+	/* A memory recording (disk=false) has no file to rotate. */
+	return ((-1 != vm->jfrState.blobFileDescriptor) && vm->jfrState.shouldRotateDisk) ? JNI_TRUE : JNI_FALSE;
 }
 
 } /* extern "C" */

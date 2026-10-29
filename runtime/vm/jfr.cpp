@@ -1471,6 +1471,17 @@ startJFRRecording(J9JavaVM *vm)
 	Assert_VM_false(vm->jfrState.isStarted);
 	Assert_VM_true(vm->jfrState.isCreated);
 
+	if (isJFRV2SupportEnabled(vm)) {
+		/* Discard data left from a previous recording, e.g. events emitted after its
+		 * last output was written, or a memory recording stopped without a destination.
+		 */
+		acquireExclusiveVMAccess(currentThread);
+		flushAllThreadBuffers(currentThread, false, true);
+		vm->jfrBuffer.bufferRemaining = vm->jfrBuffer.bufferSize;
+		vm->jfrBuffer.bufferCurrent = vm->jfrBuffer.bufferStart;
+		releaseExclusiveVMAccess(currentThread);
+	}
+
 	if ((*vmHooks)->J9HookRegisterWithCallSite(vmHooks, J9HOOK_VM_CLASSES_UNLOAD, jfrClassesUnload, OMR_GET_CALLSITE(), NULL)) {
 		goto done;
 	}
@@ -2075,8 +2086,10 @@ setJFRRecordingFileName(J9JavaVM *vm, char *newFileName)
 	VM_JFRWriter::closeJFRFile(vm);
 	j9mem_free_memory(vm->jfrState.jfrFileName);
 	vm->jfrState.jfrFileName = newFileName;
-	/* Open JFR file only if JFR has been created. */
-	if (isJFRCreated(vm)) {
+	/* Open JFR file only if JFR has been created. A NULL file name only closes
+	 * the current file, the data is then kept in memory.
+	 */
+	if (isJFRCreated(vm) && (NULL != newFileName)) {
 		success = (VM_JFRWriter::openJFRFile(vm) ? JNI_TRUE : JNI_FALSE);
 	}
 	return success;
@@ -3592,7 +3605,8 @@ notifyForChunkRotation(J9VMThread *currentThread)
 	omrthread_monitor_t monitorPtr = NULL;
 	Assert_VM_mustHaveVMAccess(currentThread);
 
-	if (JNI_FALSE == vm->jfrState.shouldRotateDisk) {
+	/* A memory recording (disk=false) has no file to rotate, the data stays in memory. */
+	if ((JNI_FALSE == vm->jfrState.shouldRotateDisk) && (-1 != vm->jfrState.blobFileDescriptor)) {
 		Trc_VM_notifyForChunkRotation(currentThread);
 
 		j9object_t chunkMonitor = J9_JNI_UNWRAP_REFERENCE(vm->jfrState.chunkRotationMonitor);
