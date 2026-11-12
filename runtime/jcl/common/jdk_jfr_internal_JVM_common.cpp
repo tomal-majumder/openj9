@@ -206,6 +206,15 @@ Java_jdk_jfr_internal_JVM_endRecording(JNIEnv *env, jobject obj)
 
 	vmFuncs->internalEnterVMFromJNI(currentThread);
 	vmFuncs->stopJFRRecording(vm);
+	/* A file still open here was opened by setOutput() for an in-memory recording's
+	 * destination (null -> file). Complete the chunk and close the file.
+	 */
+	if (NULL != vm->jfrState.jfrFileName) {
+		vmFuncs->acquireExclusiveVMAccess(currentThread);
+		vmFuncs->jfrDump(currentThread, TRUE);
+		vmFuncs->setJFRRecordingFileName(vm, NULL);
+		vmFuncs->releaseExclusiveVMAccess(currentThread);
+	}
 	vmFuncs->internalExitVMToJNI(currentThread);
 }
 
@@ -707,7 +716,12 @@ Java_jdk_jfr_internal_JVM_setOutput(JNIEnv *env, jobject obj, jstring file)
 
 	vmFuncs->internalEnterVMFromJNI(currentThread);
 	vmFuncs->acquireExclusiveVMAccess(currentThread);
-	if (NULL != currentThread->javaVM->jfrState.jfrFileName) {
+	BOOLEAN isRecording = vm->jfrState.isStarted;
+	BOOLEAN hasCurrentFile = (NULL != vm->jfrState.jfrFileName);
+	/* file -> file and file -> null while recording: complete the current chunk.
+	 * When not recording there is nothing to write.
+	 */
+	if (isRecording && hasCurrentFile) {
 		vmFuncs->jfrDump(currentThread, TRUE);
 	}
 	if (NULL != file) {
@@ -720,6 +734,13 @@ Java_jdk_jfr_internal_JVM_setOutput(JNIEnv *env, jobject obj, jstring file)
 		}
 	} else {
 		vmFuncs->setJFRRecordingFileName(vm, NULL);
+	}
+	/* null -> file while recording: write the in-memory data to the new file without
+	 * completing the chunk. Later flushes append to it, and the chunk is completed by
+	 * the next setOutput() or by endRecording().
+	 */
+	if (isRecording && !hasCurrentFile && (NULL != vm->jfrState.jfrFileName)) {
+		vmFuncs->jfrDump(currentThread, FALSE);
 	}
 	vmFuncs->releaseExclusiveVMAccess(currentThread);
 	vmFuncs->internalExitVMToJNI(currentThread);
@@ -1059,7 +1080,14 @@ Java_jdk_jfr_internal_JVM_emitOldObjectSamples(JNIEnv *env, jobject obj, jlong c
 jboolean JNICALL
 Java_jdk_jfr_internal_JVM_shouldRotateDisk(JNIEnv *env, jobject obj)
 {
-	return ((J9VMThread *)env)->javaVM->jfrState.shouldRotateDisk;
+	J9JavaVM *vm = ((J9VMThread *)env)->javaVM;
+	jboolean result = JNI_FALSE;
+
+	/* Rotation only applies when writing to a file. */
+	if (NULL != vm->jfrState.jfrFileName) {
+		result = vm->jfrState.shouldRotateDisk;
+	}
+	return result;
 }
 
 } /* extern "C" */
