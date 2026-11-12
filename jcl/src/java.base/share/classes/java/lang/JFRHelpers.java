@@ -123,34 +123,58 @@ final class JFRHelpers {
 	private static DCmdInvocation dcmdDump;
 	private static DCmdInvocation dcmdCheck;
 
+	/*[IF JAVA_SPEC_VERSION == 17]*/
+	/* -XX:FlightRecorderOptions limits, matching the reference implementation. */
+	private static final long MIN_MEMORY_SIZE = 1024 * 1024;
+	private static final long MIN_GLOBAL_BUFFER_SIZE = 64 * 1024;
+	private static final long MAX_GLOBAL_BUFFER_SIZE = 2L * 1024 * 1024 * 1024;
+	private static final long MIN_GLOBAL_BUFFER_COUNT = 2;
+	private static final long MIN_THREAD_BUFFER_SIZE = 4 * 1024;
+	private static final long MAX_THREAD_BUFFER_SIZE = 2L * 1024 * 1024 * 1024;
+	/* Same as the jdk.jfr.internal.Options default on pages up to 8K. */
+	private static final long DEFAULT_THREAD_BUFFER_SIZE = 8 * 1024;
+	/*[ENDIF] JAVA_SPEC_VERSION == 17 */
+
 	private static Long convertToBytes(String text) {
+		if (null == text) {
+			throw new IllegalArgumentException("Parsing error memory size value: syntax error, value is null");
+		}
+		if (text.startsWith("-")) {
+			throw new IllegalArgumentException("Parsing error memory size value: negative values not allowed");
+		}
 		Pattern pattern = Pattern.compile("(\\d+)([gkm]b?)?", Pattern.CASE_INSENSITIVE);
 		Matcher matcher = pattern.matcher(text);
 		if (!matcher.matches()) {
-			throw new IllegalArgumentException("Invalid memory size");
+			throw new IllegalArgumentException("Parsing error memory size value: invalid value");
 		}
 		String textValue = matcher.group(1);
 		long bytes;
 		try {
 			bytes = Long.parseLong(textValue);
 		} catch (NumberFormatException nfe) {
-			throw new IllegalArgumentException("Invalid memory size");
+			throw new IllegalArgumentException("Parsing error memory size value: invalid value");
 		}
 		String unit = matcher.group(2);
 		if ((null != unit) && !unit.isEmpty()) {
-			switch (unit.toLowerCase()) {
-			case "k":
-			case "kb":
-				bytes *= 1024L;
-				break;
-			case "m":
-			case "mb":
-				bytes *= 1024L * 1024L;
-				break;
-			case "g":
-			case "gb":
-				bytes *= 1024L * 1024L * 1024L;
-				break;
+			try {
+				switch (unit.toLowerCase()) {
+				case "k":
+				case "kb":
+					bytes = Math.multiplyExact(bytes, 1024L);
+					break;
+				case "m":
+				case "mb":
+					bytes = Math.multiplyExact(bytes, 1024L * 1024L);
+					break;
+				case "g":
+				case "gb":
+					bytes = Math.multiplyExact(bytes, 1024L * 1024L * 1024L);
+					break;
+				default:
+					throw new IllegalArgumentException("Parsing error memory size value: invalid value");
+				}
+			} catch (ArithmeticException ae) {
+				throw new IllegalArgumentException("Parsing error memory size value: invalid value");
 			}
 		}
 		return bytes;
@@ -387,13 +411,198 @@ final class JFRHelpers {
 			return;
 		}
 
+		String flightRecorderOptions = VM.getJFRFlightRecorderOptions();
 		jfrCMDLineOption = VM.getjfrCMDLineOption();
 		// JFR support is enabled with V2 implementation.
-		if (null != jfrCMDLineOption) {
+		if ((null != flightRecorderOptions) || (null != jfrCMDLineOption)) {
 			initJFRClasses();
-			initJFRCmdlineOptions();
+			if (null != flightRecorderOptions) {
+				initJFRFlightRecorderOptions(flightRecorderOptions);
+			}
+			if (null != jfrCMDLineOption) {
+				initJFRCmdlineOptions();
+			}
 		}
 	}
+
+	/**
+	 * Apply -XX:FlightRecorderOptions through DCmdConfigure.
+	 *
+	 * @param options the comma separated key=value pairs
+	 */
+	private static void initJFRFlightRecorderOptions(String options) {
+		/*[IF JAVA_SPEC_VERSION == 17]*/
+		String repositoryPath = null;
+		Integer stackDepth = null;
+		Long globalBufferCount = null;
+		Long globalBufferSize = null;
+		Long threadBufferSize = null;
+		Long memorySize = null;
+		Long maxChunkSize = null;
+		Boolean sampleThreads = null;
+		try {
+			for (String pair : options.split(",")) {
+				String[] keyValue = pair.split("=", 2);
+				String key = keyValue[0];
+				String value = (2 == keyValue.length) ? keyValue[1] : null;
+				try {
+					switch (key) {
+					case "repository":
+						repositoryPath = value;
+						break;
+					case "stackdepth":
+						stackDepth = Integer.valueOf(value);
+						break;
+					case "numglobalbuffers":
+						globalBufferCount = Long.valueOf(Long.parseLong(value));
+						if (globalBufferCount.longValue() < MIN_GLOBAL_BUFFER_COUNT) {
+							throw new IllegalArgumentException("Value specified for option \"" + key + "\" is " + value
+									+ "\nThis value is lower than the minimum required number " + MIN_GLOBAL_BUFFER_COUNT);
+						}
+						break;
+					case "globalbuffersize":
+						globalBufferSize = checkSize(key, value, MIN_GLOBAL_BUFFER_SIZE, MAX_GLOBAL_BUFFER_SIZE);
+						break;
+					case "threadbuffersize":
+						threadBufferSize = checkSize(key, value, MIN_THREAD_BUFFER_SIZE, MAX_THREAD_BUFFER_SIZE);
+						break;
+					case "memorysize":
+						memorySize = checkSize(key, value, MIN_MEMORY_SIZE, Long.MAX_VALUE);
+						break;
+					case "maxchunksize":
+						maxChunkSize = convertToBytes(value);
+						break;
+					case "samplethreads":
+						sampleThreads = parseBoolean(key, value);
+						break;
+					case "retransform":
+						/* TODO: VM-side option, not supported yet. The value is still validated. */
+						parseBoolean(key, value);
+						break;
+					case "old-object-queue-size":
+						/* TODO: VM-side option, not supported yet. */
+						break;
+					default:
+						throw new IllegalArgumentException("Unknown argument '" + key + "' in diagnostic command.");
+					}
+				} catch (NumberFormatException e) {
+					throw new IllegalArgumentException("Integer parsing error in command argument '" + key
+							+ "'. Could not parse: " + ((null == value) ? "" : value) + ".", e);
+				}
+			}
+			checkMemoryOptions(memorySize, globalBufferSize, globalBufferCount, threadBufferSize);
+		} catch (IllegalArgumentException e) {
+			throw new InternalError("Failure when starting JFR: " + e.getMessage(), e);
+		}
+		doJFRDCmdConfigureExecute(
+				false,
+				repositoryPath,
+				null,
+				stackDepth,
+				globalBufferCount,
+				globalBufferSize,
+				threadBufferSize,
+				memorySize,
+				maxChunkSize,
+				sampleThreads);
+		/*[ELSE] JAVA_SPEC_VERSION == 17 */
+		throw new InternalError("JFR support is not enabled");
+		/*[ENDIF] JAVA_SPEC_VERSION == 17 */
+	}
+
+	/*[IF JAVA_SPEC_VERSION == 17]*/
+	/**
+	 * Convert a -XX:FlightRecorderOptions memory size to bytes and check it is within [minimum, maximum].
+	 *
+	 * @param key the option name
+	 * @param value the option value, or null if no value was given
+	 * @param minimum the smallest allowed size in bytes
+	 * @param maximum the largest allowed size in bytes
+	 * @return the size in bytes
+	 */
+	private static Long checkSize(String key, String value, long minimum, long maximum) {
+		long size = convertToBytes(value).longValue();
+		if (size < minimum) {
+			throw new IllegalArgumentException("Value specified for option \"" + key + "\" is " + value
+					+ "\nThis value is lower than the minimum size required " + minimum);
+		}
+		if (size > maximum) {
+			throw new IllegalArgumentException("Value specified for option \"" + key + "\" is " + value
+					+ "\nThis value is higher than the maximum size limited " + maximum);
+		}
+		return Long.valueOf(size);
+	}
+
+	/**
+	 * Parse a -XX:FlightRecorderOptions boolean, which must be true or false.
+	 *
+	 * @param key the option name
+	 * @param value the option value
+	 * @return the parsed value
+	 */
+	private static Boolean parseBoolean(String key, String value) {
+		if ("true".equals(value)) {
+			return Boolean.TRUE;
+		}
+		if ("false".equals(value)) {
+			return Boolean.FALSE;
+		}
+		throw new IllegalArgumentException("Boolean parsing error in command argument '" + key
+				+ "'. Could not parse: " + value + ".");
+	}
+
+	/**
+	 * Check the relations between the specified memory options.
+	 *
+	 * @param memorySize memorysize in bytes, or null if not specified
+	 * @param globalBufferSize globalbuffersize in bytes, or null if not specified
+	 * @param globalBufferCount numglobalbuffers, or null if not specified
+	 * @param threadBufferSize threadbuffersize in bytes, or null if not specified
+	 */
+	private static void checkMemoryOptions(Long memorySize, Long globalBufferSize, Long globalBufferCount, Long threadBufferSize) {
+		if (null != globalBufferSize) {
+			long bufferSize = globalBufferSize.longValue();
+			if ((null != threadBufferSize) && (threadBufferSize.longValue() > bufferSize)) {
+				throw new IllegalArgumentException("The value for option \"threadbuffersize\" should not be larger than the value specified for option \"globalbuffersize\"");
+			}
+			if (null != globalBufferCount) {
+				long total;
+				try {
+					total = Math.multiplyExact(bufferSize, globalBufferCount.longValue());
+				} catch (ArithmeticException e) {
+					total = Long.MAX_VALUE;
+				}
+				if (null != memorySize) {
+					if (total != memorySize.longValue()) {
+						throw new IllegalArgumentException("These values are causing an ambiguity when trying to determine how much memory to use"
+								+ "\n\"globalbuffersize\" * \"numglobalbuffers\" do not equal \"memorysize\"");
+					}
+				} else if (total < MIN_MEMORY_SIZE) {
+					throw new IllegalArgumentException("\"globalbuffersize\" * \"numglobalbuffers\" (" + total
+							+ ") is lower than minimum memory size required " + MIN_MEMORY_SIZE);
+				}
+			} else if (null != memorySize) {
+				long bufferCount = memorySize.longValue() / bufferSize;
+				if (bufferCount < MIN_GLOBAL_BUFFER_COUNT) {
+					throw new IllegalArgumentException("numglobalbuffers " + bufferCount + " is less than minimal value " + MIN_GLOBAL_BUFFER_COUNT
+							+ "\nDecrease globalbuffersize/threadbuffersize or increase memorysize");
+				}
+			}
+		} else if (null != memorySize) {
+			long totalSize = memorySize.longValue();
+			if ((null != threadBufferSize) && (threadBufferSize.longValue() > totalSize)) {
+				throw new IllegalArgumentException("The value for option \"threadbuffersize\" should not be larger than the value specified for option \"memorysize\"");
+			}
+			if ((null != globalBufferCount) && (null == threadBufferSize)) {
+				long bufferSize = totalSize / globalBufferCount.longValue();
+				if (bufferSize < DEFAULT_THREAD_BUFFER_SIZE) {
+					throw new IllegalArgumentException("globalbuffersize " + bufferSize + " is less than threadbuffersize " + DEFAULT_THREAD_BUFFER_SIZE
+							+ "\nDecrease globalbuffersize or increase memorysize or adjust global/threadbuffersize");
+				}
+			}
+		}
+	}
+	/*[ENDIF] JAVA_SPEC_VERSION == 17 */
 
 	static void initJFR() {
 		if (!VM.isJFREnabled() || VM.isJFRV2SupportEnabled()) {
