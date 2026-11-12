@@ -582,6 +582,16 @@ Java_com_ibm_oti_vm_VM_getjfrCMDLineOption(JNIEnv *env, jclass clazz)
 	return jfrOption;
 }
 jstring JNICALL
+Java_com_ibm_oti_vm_VM_getJFRFlightRecorderOptions(JNIEnv *env, jclass clazz)
+{
+	J9JavaVM *javaVM = ((J9VMThread *)env)->javaVM;
+	jstring flightRecorderOptions = NULL;
+	if (NULL != javaVM->jfrState.flightRecorderOptions) {
+		flightRecorderOptions = (*env)->NewStringUTF(env, javaVM->jfrState.flightRecorderOptions);
+	}
+	return flightRecorderOptions;
+}
+jstring JNICALL
 Java_com_ibm_oti_vm_VM_getJfrDelay(JNIEnv *env, jclass clazz)
 {
 	J9JavaVM *javaVM = ((J9VMThread *)env)->javaVM;
